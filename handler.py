@@ -1,11 +1,13 @@
 import base64
 import io
+import math
 import os
 import re
 import traceback
 import importlib.metadata
 import threading
 import warnings
+from pathlib import PurePosixPath
 
 import runpod
 torch = None
@@ -16,9 +18,12 @@ REVISION = "92196c8e11f7b6cf2b7493e037d8c5345c559216"
 SIZES = {(640, 640), (768, 768), (1024, 1024), (1024, 768), (768, 1024)}
 Image.MAX_IMAGE_PIXELS = 20_000_000
 PRECISION = os.environ.get("FLUX9B_PRECISION", "nf4").strip().lower()
-WORKER_VERSION = "klein9-diagnostics-v2"
+WORKER_VERSION = "klein9-lora-v1"
 phase = "registered"
 load_error = None
+
+loaded_lora = None
+lora_failed = False
 
 
 def safe_text(value):
@@ -35,8 +40,12 @@ def safe_text(value):
 def failure(error, failed_phase):
     return {
         "error": safe_text(f"{failed_phase}: {type(error).__name__}: {error}"),
-        "diagnostic": {"worker_version": WORKER_VERSION, "phase": failed_phase,
-                       "error_type": type(error).__name__, "traceback": safe_text(traceback.format_exc(limit=6))},
+        "diagnostic": {
+            "worker_version": WORKER_VERSION,
+            "phase": failed_phase,
+            "error_type": type(error).__name__,
+            "traceback": safe_text(traceback.format_exc(limit=6)),
+        },
     }
 
 
@@ -50,9 +59,12 @@ def runtime_imports():
 
 def diagnose():
     global phase
-    report = {"worker_version": WORKER_VERSION, "precision": PRECISION,
-              "hf_token_configured": bool(os.environ.get("HF_TOKEN", "").strip()),
-              "model_weights_downloaded": False}
+    report = {
+        "worker_version": WORKER_VERSION,
+        "precision": PRECISION,
+        "hf_token_configured": bool(os.environ.get("HF_TOKEN", "").strip()),
+        "model_weights_downloaded": False,
+    }
     try:
         phase = "configuration"
         token = os.environ.get("HF_TOKEN", "").strip()
@@ -66,7 +78,10 @@ def diagnose():
         runtime_imports()
         if PRECISION == "nf4":
             import bitsandbytes
-        report["versions"] = {name: importlib.metadata.version(name) for name in ("torch", "diffusers", "transformers", "accelerate", "bitsandbytes")}
+        report["versions"] = {
+            name: importlib.metadata.version(name)
+            for name in ("torch", "diffusers", "transformers", "accelerate", "bitsandbytes")
+        }
         phase = "gpu"
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA GPUを認識できません。GPUワーカーの選択を確認してください。")
@@ -76,7 +91,6 @@ def diagnose():
         report["vram_total_gib"] = round(total / 1024**3, 2)
         phase = "hugging_face_access"
         from huggingface_hub import hf_hub_url, get_hf_file_metadata
-        # HEAD checks the gated file access; no 35GB weights are fetched.
         get_hf_file_metadata(hf_hub_url(MODEL, "model_index.json", revision=REVISION), token=token, timeout=20)
         report["model_access"] = "ok"
         report["ok"] = True
@@ -102,26 +116,43 @@ def load_pipeline():
     phase = "gpu"
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA対応GPUのワーカーを選択してください。")
-    shared = dict(revision=REVISION, token=token, torch_dtype=torch.bfloat16, use_safetensors=True, low_cpu_mem_usage=True, device_map={"": 0})
+    shared = dict(
+        revision=REVISION,
+        token=token,
+        torch_dtype=torch.bfloat16,
+        use_safetensors=True,
+        low_cpu_mem_usage=True,
+        device_map={"": 0},
+    )
     transformer_args, encoder_args = {}, {}
     if PRECISION == "nf4":
         transformer_args["quantization_config"] = DiffusersBitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
         )
         encoder_args["quantization_config"] = TransformersBitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
         )
-    # Load both large components directly onto GPU; do not retain full BF16 copies in host RAM.
     phase = "transformer_load"
     transformer = Flux2Transformer2DModel.from_pretrained(MODEL, subfolder="transformer", **shared, **transformer_args)
     phase = "text_encoder_load"
     text_encoder = Qwen3ForCausalLM.from_pretrained(MODEL, subfolder="text_encoder", **shared, **encoder_args)
     phase = "pipeline_assembly"
     pipeline = Flux2KleinPipeline.from_pretrained(
-        MODEL, revision=REVISION, token=token, transformer=transformer, text_encoder=text_encoder,
-        torch_dtype=torch.bfloat16, use_safetensors=True, low_cpu_mem_usage=True,
+        MODEL,
+        revision=REVISION,
+        token=token,
+        transformer=transformer,
+        text_encoder=text_encoder,
+        torch_dtype=torch.bfloat16,
+        use_safetensors=True,
+        low_cpu_mem_usage=True,
     )
-    # Quantized components already reside on CUDA. Move only the small, unquantized VAE.
     pipeline.vae.to(device="cuda:0", dtype=torch.bfloat16)
     phase = "ready"
     return pipeline
@@ -134,9 +165,11 @@ lock = threading.Lock()
 def parse_request(p):
     if p.get("mode") != "flux2_klein9_i2i":
         raise ValueError("FLUX.2 klein 9B用アプリから送信してください。")
+
     encoded = p.get("image_base64")
     if not isinstance(encoded, str) or not 1 <= len(encoded) <= 4_000_000:
         raise ValueError("元画像が必要です。送信画像は3MB以下にしてください。")
+
     raw = base64.b64decode(encoded, validate=True)
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -144,32 +177,128 @@ def parse_request(p):
             if image.format not in ("JPEG", "PNG", "WEBP"):
                 raise ValueError("JPEG・PNG・WebPを選んでください。")
             image = ImageOps.exif_transpose(image).convert("RGB")
-    width, height = int(p.get("width", 1024)), int(p.get("height", 1024))
+
+    width = int(p.get("width", 1024))
+    height = int(p.get("height", 1024))
     if (width, height) not in SIZES:
         raise ValueError("未対応の出力サイズです。")
+
     prompt = str(p.get("prompt", "")).strip()
     if not 1 <= len(prompt) <= 3000:
         raise ValueError("編集指示は1〜3000文字で入力してください。")
+
     seed = int(p.get("seed", 42))
     if not 0 <= seed <= 2147483647:
         raise ValueError("シード値を確認してください。")
-    if p.get("lora") is not None or p.get("mask_base64"):
-        raise ValueError("この初期版はLoRA・マスク入力には対応していません。")
-    # Keep the complete reference image; all dimensions are multiples of 32.
+
+    if p.get("mask_base64"):
+        raise ValueError("このバージョンはマスク入力には対応していません。")
+
+    lora = p.get("lora")
+    if lora is not None:
+        if not isinstance(lora, dict):
+            raise ValueError("LoRA設定を確認してください。")
+
+        repo = lora.get("repo", "")
+        filename = lora.get("filename", "")
+        scale = float(lora.get("scale", 0.85))
+
+        if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repo):
+            raise ValueError("LoRAの公開Hugging FaceリポジトリIDを入力してください。例: diroverflo/FLux_Klein_9B_NSFW")
+
+        if (
+            not isinstance(filename, str)
+            or len(filename) > 200
+            or not re.fullmatch(r"[A-Za-z0-9_./\-\s]+\.safetensors", filename)
+            or filename.startswith("/")
+            or ".." in PurePosixPath(filename).parts
+        ):
+            raise ValueError("LoRAはリポジトリ内の.safetensorsファイルを指定してください。")
+
+        if not math.isfinite(scale) or not 0.05 <= scale <= 1.5:
+            raise ValueError("LoRA強度は0.05〜1.5の範囲で指定してください。")
+
+       lora = {"repo": repo, "filename": filename, "scale": scale}
+
     image = ImageOps.pad(image, (width, height), method=Image.Resampling.LANCZOS, color="black")
-    return image, prompt, width, height, seed
+    return image, prompt, width, height, seed, lora
+
+
+def configure_lora(lora):
+    global loaded_lora, lora_failed, pipe
+
+    if lora_failed:
+        raise RuntimeError("LoRA読み込みに以前失敗した状態です。Workerを再起動してください。")
+
+    if lora is None:
+        if loaded_lora is not None:
+            try:
+                pipe.unload_lora_weights()
+            except Exception:
+                pass
+            loaded_lora = None
+        return None
+
+    from huggingface_hub import HfApi, hf_hub_download
+    from safetensors.torch import load_file
+
+    identity = (lora["repo"], lora["filename"])
+    mutating = False
+
+    try:
+        if loaded_lora is None or loaded_lora[:2] != identity:
+            info = HfApi().model_info(lora["repo"], files_metadata=True, token=False)
+            file_info = next(
+                (item for item in info.siblings if item.rfilename == lora["filename"]),
+                None,
+            )
+            if file_info is None or file_info.size is None or file_info.size > 1024 * 1024 * 1024:
+                raise ValueError("LoRAファイルが見つからないか、1GBを超えています。")
+
+            path = hf_hub_download(
+                lora["repo"],
+                filename=lora["filename"],
+                revision=info.sha,
+                token=False,
+            )
+
+            state = load_file(path, device="cpu")
+            if not state:
+                raise ValueError("LoRAファイルが空です。")
+
+            mutating = True
+            if loaded_lora is not None:
+                try:
+                    pipe.unload_lora_weights()
+                except Exception:
+                    pass
+                loaded_lora = None
+
+            pipe.load_lora_weights(path, adapter_name="style")
+            loaded_lora = (*identity, info.sha)
+
+        pipe.set_adapters(["style"], adapter_weights=[lora["scale"]])
+        return {**lora, "revision": loaded_lora[2]}
+
+    except Exception as e:
+        if mutating:
+            lora_failed = True
+        raise RuntimeError(f"LoRA読み込みに失敗しました: {str(e)}") from e
 
 
 def handler(job):
     global pipe, load_error, phase
     p = job.get("input", {})
+
     if p.get("diagnose") is True:
         with lock:
             return diagnose()
+
     try:
-        image, prompt, width, height, seed = parse_request(p)
+        image, prompt, width, height, seed, lora = parse_request(p)
     except Exception as error:
         return failure(error, "input_validation")
+
     with lock:
         if load_error is not None:
             return load_error
@@ -180,28 +309,47 @@ def handler(job):
             load_error = failure(error, phase)
             print(load_error["error"], flush=True)
             return load_error
+
         try:
+            phase = "lora"
+            used_lora = configure_lora(lora)
+
             phase = "inference"
             with torch.inference_mode():
                 result = pipe(
-                    image=image, prompt=prompt, width=width, height=height,
-                    num_inference_steps=4, guidance_scale=1.0,
-                    generator=torch.Generator("cpu").manual_seed(seed), num_images_per_prompt=1,
+                    image=image,
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    num_inference_steps=4,
+                    guidance_scale=1.0,
+                    generator=torch.Generator("cpu").manual_seed(seed),
+                    num_images_per_prompt=1,
                     max_sequence_length=512,
                 ).images[0]
+
             buffer = io.BytesIO()
             result.save(buffer, format="PNG")
             phase = "ready"
+
             return {
                 "image_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
-                "mime_type": "image/png", "mode": "flux2_klein9_i2i", "model": MODEL,
-                "width": result.width, "height": result.height, "seed": seed,
-                "steps": 4, "guidance": 1.0, "revision": REVISION, "precision": PRECISION,
+                "mime_type": "image/png",
+                "mode": "flux2_klein9_i2i",
+                "model": MODEL,
+                "width": result.width,
+                "height": result.height,
+                "seed": seed,
+                "steps": 4,
+                "guidance": 1.0,
+                "revision": REVISION,
+                "precision": PRECISION,
                 "worker_version": WORKER_VERSION,
+                "lora": used_lora,
             }
         except Exception as error:
             return failure(error, phase)
 
 
-print("FRAME klein9-diagnostics-v2: handler registered; model loads on generation request", flush=True)
+print("FRAME klein9-lora-v1: handler registered; model loads on generation request", flush=True)
 runpod.serverless.start({"handler": handler})
