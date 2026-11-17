@@ -1,5 +1,8 @@
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
-RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+ENV CC=/usr/bin/gcc
+ENV CXX=/usr/bin/g++
+RUN /usr/bin/gcc --version && /usr/bin/g++ --version
 WORKDIR /app
 RUN pip install --no-cache-dir \
     runpod==1.7.9 \
