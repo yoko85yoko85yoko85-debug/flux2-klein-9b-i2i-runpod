@@ -12,8 +12,10 @@ RUN pip install --no-cache-dir \
     huggingface-hub==0.36.0 \
     safetensors==0.5.3 \
     Pillow==11.2.1 \
-    bitsandbytes==0.48.1
+    bitsandbytes==0.48.1 \
+    peft==0.17.1
 COPY handler.py /app/handler.py
+RUN python -m py_compile /app/handler.py
 ENV HF_HOME=/runpod-volume/huggingface
 ENV PYTHONUNBUFFERED=1
 ENV TOKENIZERS_PARALLELISM=false

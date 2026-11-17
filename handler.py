@@ -18,7 +18,7 @@ REVISION = "92196c8e11f7b6cf2b7493e037d8c5345c559216"
 SIZES = {(640, 640), (768, 768), (1024, 1024), (1024, 768), (768, 1024)}
 Image.MAX_IMAGE_PIXELS = 20_000_000
 PRECISION = os.environ.get("FLUX9B_PRECISION", "nf4").strip().lower()
-WORKER_VERSION = "klein9-lora-v1"
+WORKER_VERSION = "klein9-lora-v2"
 phase = "registered"
 load_error = None
 
@@ -55,6 +55,7 @@ def runtime_imports():
     import torch
     from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel, BitsAndBytesConfig as DiffusersBitsAndBytesConfig
     from transformers import Qwen3ForCausalLM, BitsAndBytesConfig as TransformersBitsAndBytesConfig
+    import peft
 
 
 def diagnose():
@@ -80,7 +81,7 @@ def diagnose():
             import bitsandbytes
         report["versions"] = {
             name: importlib.metadata.version(name)
-            for name in ("torch", "diffusers", "transformers", "accelerate", "bitsandbytes")
+            for name in ("torch", "diffusers", "transformers", "accelerate", "bitsandbytes", "peft")
         }
         phase = "gpu"
         if not torch.cuda.is_available():
@@ -198,92 +199,79 @@ def parse_request(p):
     if lora is not None:
         if not isinstance(lora, dict):
             raise ValueError("LoRA設定を確認してください。")
-
         repo = lora.get("repo", "")
         filename = lora.get("filename", "")
-        scale = float(lora.get("scale", 0.85))
-
-        if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repo):
-            raise ValueError("LoRAの公開Hugging FaceリポジトリIDを入力してください。例: diroverflo/FLux_Klein_9B_NSFW")
-
-        if (
-            not isinstance(filename, str)
-            or len(filename) > 200
-            or not re.fullmatch(r"[A-Za-z0-9_./\-\s]+\.safetensors", filename)
-            or filename.startswith("/")
-            or ".." in PurePosixPath(filename).parts
-        ):
-            raise ValueError("LoRAはリポジトリ内の.safetensorsファイルを指定してください。")
-
+        if not isinstance(repo, str) or not isinstance(filename, str):
+            raise ValueError("LoRAのrepoとfilenameは文字列で指定してください。")
+        repo, filename = repo.strip(), filename.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repo):
+            raise ValueError("LoRAのrepoは公開Hugging FaceリポジトリIDを指定してください。例: author/repository")
+        if (len(filename) > 200 or not re.fullmatch(r"[A-Za-z0-9_./ -]+\.safetensors", filename)
+                or filename.startswith("/") or ".." in PurePosixPath(filename).parts):
+            raise ValueError("LoRAのfilenameはリポジトリ内の.safetensorsファイルを指定してください。")
+        raw_scale = lora.get("scale", 0.85)
+        if isinstance(raw_scale, bool):
+            raise ValueError("LoRAのscaleは数値で指定してください。")
+        try:
+            scale = float(raw_scale)
+        except (TypeError, ValueError):
+            raise ValueError("LoRAのscaleは数値で指定してください。") from None
         if not math.isfinite(scale) or not 0.05 <= scale <= 1.5:
-            raise ValueError("LoRA強度は0.05〜1.5の範囲で指定してください。")
-
-       lora = {"repo": repo, "filename": filename, "scale": scale}
+            raise ValueError("LoRAのscaleは0.05〜1.5の範囲で指定してください。")
+        lora = {"repo": repo, "filename": filename, "scale": scale}
 
     image = ImageOps.pad(image, (width, height), method=Image.Resampling.LANCZOS, color="black")
     return image, prompt, width, height, seed, lora
 
 
+def unload_current_lora():
+    global loaded_lora, lora_failed
+    if loaded_lora is None:
+        return
+    try:
+        pipe.unload_lora_weights()
+    except Exception as error:
+        lora_failed = True
+        raise RuntimeError("LoRAを解除できませんでした。誤った状態での生成を防ぐため停止しました。Workerを再起動してください。") from error
+    loaded_lora = None
+
+
 def configure_lora(lora):
-    global loaded_lora, lora_failed, pipe
-
+    global loaded_lora, lora_failed
     if lora_failed:
-        raise RuntimeError("LoRA読み込みに以前失敗した状態です。Workerを再起動してください。")
-
+        raise RuntimeError("LoRA変更に以前失敗した状態です。Workerを再起動してから再実行してください。")
     if lora is None:
-        if loaded_lora is not None:
-            try:
-                pipe.unload_lora_weights()
-            except Exception:
-                pass
-            loaded_lora = None
+        unload_current_lora()
         return None
 
     from huggingface_hub import HfApi, hf_hub_download
-    from safetensors.torch import load_file
-
+    from safetensors import safe_open
     identity = (lora["repo"], lora["filename"])
     mutating = False
-
     try:
         if loaded_lora is None or loaded_lora[:2] != identity:
             info = HfApi().model_info(lora["repo"], files_metadata=True, token=False)
-            file_info = next(
-                (item for item in info.siblings if item.rfilename == lora["filename"]),
-                None,
-            )
+            file_info = next((item for item in info.siblings if item.rfilename == lora["filename"]), None)
             if file_info is None or file_info.size is None or file_info.size > 1024 * 1024 * 1024:
                 raise ValueError("LoRAファイルが見つからないか、1GBを超えています。")
-
-            path = hf_hub_download(
-                lora["repo"],
-                filename=lora["filename"],
-                revision=info.sha,
-                token=False,
-            )
-
-            state = load_file(path, device="cpu")
-            if not state:
-                raise ValueError("LoRAファイルが空です。")
-
+            path = hf_hub_download(lora["repo"], filename=lora["filename"], revision=info.sha, token=False)
+            # Header-only validation avoids holding an extra full copy of the LoRA tensors in host RAM.
+            with safe_open(path, framework="pt", device="cpu") as weights:
+                if not weights.keys():
+                    raise ValueError("LoRAファイルが空です。")
             mutating = True
-            if loaded_lora is not None:
-                try:
-                    pipe.unload_lora_weights()
-                except Exception:
-                    pass
-                loaded_lora = None
-
-            pipe.load_lora_weights(path, adapter_name="style")
+            unload_current_lora()
+            # Let the native loader retain safetensors metadata and handle supported Flux2 LoRA formats.
+            pipe.load_lora_weights(path, adapter_name="style", use_safetensors=True)
             loaded_lora = (*identity, info.sha)
-
+        mutating = True
+        pipe.enable_lora()
         pipe.set_adapters(["style"], adapter_weights=[lora["scale"]])
         return {**lora, "revision": loaded_lora[2]}
-
-    except Exception as e:
+    except Exception as error:
         if mutating:
             lora_failed = True
-        raise RuntimeError(f"LoRA読み込みに失敗しました: {str(e)}") from e
+        raise RuntimeError("LoRAの変更に失敗しました: " + safe_text(error)) from error
 
 
 def handler(job):
@@ -351,5 +339,5 @@ def handler(job):
             return failure(error, phase)
 
 
-print("FRAME klein9-lora-v1: handler registered; model loads on generation request", flush=True)
+print("FRAME klein9-lora-v2: handler registered; model loads on generation request", flush=True)
 runpod.serverless.start({"handler": handler})
