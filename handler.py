@@ -18,7 +18,7 @@ REVISION = "92196c8e11f7b6cf2b7493e037d8c5345c559216"
 SIZES = {(640, 640), (768, 768), (1024, 1024), (1024, 768), (768, 1024)}
 Image.MAX_IMAGE_PIXELS = 20_000_000
 PRECISION = os.environ.get("FLUX9B_PRECISION", "nf4").strip().lower()
-WORKER_VERSION = "klein9-lora-v3-sizing"
+WORKER_VERSION = "klein9-lora-v4-multi"
 phase = "registered"
 load_error = None
 
@@ -195,8 +195,13 @@ def parse_request(p):
     if p.get("mask_base64"):
         raise ValueError("このバージョンはマスク入力には対応していません。")
 
-    lora = p.get("lora")
-    if lora is not None:
+    if "loras" in p and "lora" in p:
+        raise ValueError("loraとlorasは同時に指定できません。")
+    requested = p.get("loras") if "loras" in p else ([] if p.get("lora") is None else [p["lora"]])
+    if not isinstance(requested, list) or len(requested) > 2:
+        raise ValueError("lorasは最大2つの配列で指定してください。")
+    result = []
+    for lora in requested:
         if not isinstance(lora, dict):
             raise ValueError("LoRA設定を確認してください。")
         repo = lora.get("repo", "")
@@ -218,7 +223,12 @@ def parse_request(p):
             raise ValueError("LoRAのscaleは数値で指定してください。") from None
         if not math.isfinite(scale) or not 0.05 <= scale <= 1.5:
             raise ValueError("LoRAのscaleは0.05〜1.5の範囲で指定してください。")
-        lora = {"repo": repo, "filename": filename, "scale": scale}
+        result.append({"repo": repo, "filename": filename, "scale": scale})
+
+    identities = [(item["repo"], item["filename"]) for item in result]
+    if len(set(identities)) != len(identities):
+        raise ValueError("同じLoRAを2つの欄に指定できません。")
+    lora = result
 
     image = ImageOps.pad(image, (width, height), method=Image.Resampling.LANCZOS, color="black")
     return image, prompt, width, height, seed, lora
@@ -236,38 +246,42 @@ def unload_current_lora():
     loaded_lora = None
 
 
-def configure_lora(lora):
+def configure_lora(loras):
     global loaded_lora, lora_failed
     if lora_failed:
         raise RuntimeError("LoRA変更に以前失敗した状態です。Workerを再起動してから再実行してください。")
-    if lora is None:
+    if not loras:
         unload_current_lora()
-        return None
+        return []
 
     from huggingface_hub import HfApi, hf_hub_download
     from safetensors import safe_open
-    identity = (lora["repo"], lora["filename"])
+    identities = [(item["repo"], item["filename"]) for item in loras]
     mutating = False
     try:
-        if loaded_lora is None or loaded_lora[:2] != identity:
-            info = HfApi().model_info(lora["repo"], files_metadata=True, token=False)
-            file_info = next((item for item in info.siblings if item.rfilename == lora["filename"]), None)
-            if file_info is None or file_info.size is None or file_info.size > 1024 * 1024 * 1024:
-                raise ValueError("LoRAファイルが見つからないか、1GBを超えています。")
-            path = hf_hub_download(lora["repo"], filename=lora["filename"], revision=info.sha, token=False)
-            # Header-only validation avoids holding an extra full copy of the LoRA tensors in host RAM.
-            with safe_open(path, framework="pt", device="cpu") as weights:
-                if not weights.keys():
-                    raise ValueError("LoRAファイルが空です。")
+        if loaded_lora is None or [item[:2] for item in loaded_lora] != identities:
+            prepared = []
+            for lora in loras:
+                info = HfApi().model_info(lora["repo"], files_metadata=True, token=False)
+                file_info = next((item for item in info.siblings if item.rfilename == lora["filename"]), None)
+                if file_info is None or file_info.size is None or file_info.size > 1024 * 1024 * 1024:
+                    raise ValueError("LoRAファイルが見つからないか、1GBを超えています。")
+                path = hf_hub_download(lora["repo"], filename=lora["filename"], revision=info.sha, token=False)
+                with safe_open(path, framework="pt", device="cpu") as weights:
+                    if not weights.keys():
+                        raise ValueError("LoRAファイルが空です。")
+                prepared.append((path, info.sha))
+            # Validate every file before changing any currently loaded adapter.
             mutating = True
             unload_current_lora()
-            # Let the native loader retain safetensors metadata and handle supported Flux2 LoRA formats.
-            pipe.load_lora_weights(path, adapter_name="style", use_safetensors=True)
-            loaded_lora = (*identity, info.sha)
+            for index, (path, _) in enumerate(prepared):
+                pipe.load_lora_weights(path, adapter_name="style" + str(index), use_safetensors=True)
+            loaded_lora = [(*identity, prepared[index][1]) for index, identity in enumerate(identities)]
         mutating = True
         pipe.enable_lora()
-        pipe.set_adapters(["style"], adapter_weights=[lora["scale"]])
-        return {**lora, "revision": loaded_lora[2]}
+        pipe.set_adapters(["style" + str(index) for index in range(len(loras))],
+                          adapter_weights=[item["scale"] for item in loras])
+        return [{**item, "revision": loaded_lora[index][2]} for index, item in enumerate(loras)]
     except Exception as error:
         if mutating:
             lora_failed = True
@@ -333,11 +347,12 @@ def handler(job):
                 "revision": REVISION,
                 "precision": PRECISION,
                 "worker_version": WORKER_VERSION,
-                "lora": used_lora,
+                "lora": used_lora[0] if len(used_lora) == 1 else None,
+                "loras": used_lora,
             }
         except Exception as error:
             return failure(error, phase)
 
 
-print("FRAME klein9-lora-v3-sizing: handler registered; model loads on generation request", flush=True)
+print("FRAME klein9-lora-v4-multi: handler registered; model loads on generation request", flush=True)
 runpod.serverless.start({"handler": handler})
