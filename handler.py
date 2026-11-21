@@ -18,7 +18,7 @@ REVISION = "92196c8e11f7b6cf2b7493e037d8c5345c559216"
 SIZES = {(640, 640), (768, 768), (1024, 1024), (1024, 768), (768, 1024)}
 Image.MAX_IMAGE_PIXELS = 20_000_000
 PRECISION = os.environ.get("FLUX9B_PRECISION", "nf4").strip().lower()
-WORKER_VERSION = "klein9-lora-v2"
+WORKER_VERSION = "klein9-lora-v3-sizing"
 phase = "registered"
 load_error = None
 
@@ -181,7 +181,7 @@ def parse_request(p):
 
     width = int(p.get("width", 1024))
     height = int(p.get("height", 1024))
-    if (width, height) not in SIZES:
+    if any(n < 256 or n > 2048 or n % 32 for n in (width, height)) or width * height > 4_194_304:
         raise ValueError("未対応の出力サイズです。")
 
     prompt = str(p.get("prompt", "")).strip()
@@ -339,5 +339,5 @@ def handler(job):
             return failure(error, phase)
 
 
-print("FRAME klein9-lora-v2: handler registered; model loads on generation request", flush=True)
+print("FRAME klein9-lora-v3-sizing: handler registered; model loads on generation request", flush=True)
 runpod.serverless.start({"handler": handler})
